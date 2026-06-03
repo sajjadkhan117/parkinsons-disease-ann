@@ -1,0 +1,816 @@
+import os, time, warnings
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.patches import FancyBboxPatch
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+# -----------------------------------------------------------------------------
+# HELPERS – MNIST loader
+# -----------------------------------------------------------------------------
+def load_mnist():
+    """Load MNIST; try multiple backends. Returns float32 arrays normalised to [0,1]."""
+    try:
+        from tensorflow.keras.datasets import mnist
+        (X_tr, y_tr), (X_te, y_te) = mnist.load_data()
+        X_tr = X_tr.reshape(-1, 784).astype(np.float32) / 255.0
+        X_te = X_te.reshape(-1, 784).astype(np.float32) / 255.0
+        print("  MNIST loaded via Keras.")
+        return X_tr, y_tr, X_te, y_te
+    except Exception:
+        pass
+    try:
+        import torchvision, torchvision.transforms as T, torch
+        tr = torchvision.datasets.MNIST(root='/tmp/mnist', train=True,  download=True, transform=T.ToTensor())
+        te = torchvision.datasets.MNIST(root='/tmp/mnist', train=False, download=True, transform=T.ToTensor())
+        X_tr = tr.data.numpy().reshape(-1,784).astype(np.float32)/255.0
+        y_tr = tr.targets.numpy()
+        X_te = te.data.numpy().reshape(-1,784).astype(np.float32)/255.0
+        y_te = te.targets.numpy()
+        print("  MNIST loaded via torchvision.")
+        return X_tr, y_tr, X_te, y_te
+    except Exception:
+        pass
+    # Fallback – synthesise MNIST-like data for demonstration
+    print("  WARNING: Real MNIST unavailable – using synthetic data for demonstration.")
+    rng = np.random.RandomState(0)
+    n_tr, n_te = 10000, 2000
+    X_tr = rng.rand(n_tr, 784).astype(np.float32)
+    y_tr = rng.randint(0, 10, n_tr)
+    X_te = rng.rand(n_te, 784).astype(np.float32)
+    y_te = rng.randint(0, 10, n_te)
+    return X_tr, y_tr, X_te, y_te
+
+def save_fig(name, tight=True):
+    path = f"/mnt/user-data/outputs/{name}.png"
+    if tight:
+        plt.tight_layout()
+    plt.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close("all")
+    print(f"  Figure saved: {path}")
+    return path
+
+
+# -----------------------------------------------------------------------------
+# PART A – PERCEPTRON
+# -----------------------------------------------------------------------------
+class Perceptron:
+    """Single-layer Perceptron (step activation, NumPy only)."""
+    def __init__(self, n_features, lr=0.01):
+        self.w  = np.zeros(n_features)
+        self.b  = 0.0
+        self.lr = lr
+
+    def predict(self, X):
+        return np.where(X @ self.w + self.b >= 0, 1, 0)
+
+    def fit(self, X, y, epochs=50):
+        history = {"weights": [], "errors": [], "accuracy": []}
+        for ep in range(epochs):
+            errors = 0
+            for xi, yi in zip(X, y):
+                yhat = int(xi @ self.w + self.b >= 0)
+                delta = self.lr * (yi - yhat)
+                self.w += delta * xi
+                self.b += delta
+                errors += int(yi != yhat)
+            acc = 1 - errors / len(y)
+            history["weights"].append(self.w.copy())
+            history["errors"].append(errors)
+            history["accuracy"].append(acc)
+            if errors == 0:
+                print(f"    Converged at epoch {ep+1}")
+                break
+        return history
+
+
+def run_part_a(X_tr, y_tr, X_te, y_te):
+    print("\n" + "="*60)
+    print(" PART A – Perceptron Model")
+    print("="*60)
+
+    # Binary task: digit 0 vs digit 1
+    mask_tr = np.isin(y_tr, [0, 1])
+    mask_te = np.isin(y_te, [0, 1])
+    Xb_tr, yb_tr = X_tr[mask_tr][:2000], (y_tr[mask_tr][:2000] == 1).astype(int)
+    Xb_te, yb_te = X_te[mask_te][:400],  (y_te[mask_te][:400]  == 1).astype(int)
+
+    p = Perceptron(784, lr=0.01)
+    hist = p.fit(Xb_tr, yb_tr, epochs=50)
+
+    preds = p.predict(Xb_te)
+    acc = np.mean(preds == yb_te)
+    print(f"  Test accuracy (0 vs 1): {acc*100:.1f}%")
+
+    # -- Figure A1: Convergence (errors per epoch) --------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(hist["errors"], "b-o", markersize=3)
+    axes[0].set_title("Perceptron – Misclassification Count per Epoch")
+    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Errors")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(hist["accuracy"], "g-o", markersize=3)
+    axes[1].set_title("Perceptron – Training Accuracy per Epoch")
+    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Accuracy")
+    axes[1].set_ylim(0, 1); axes[1].grid(True, alpha=0.3)
+    fig_a1 = save_fig("partA_convergence")
+
+    # -- Figure A2: Weight visualisation ------------------------------------
+    fig, axes = plt.subplots(2, 5, figsize=(12, 5))
+    epochs_show = np.linspace(0, len(hist["weights"])-1, 10, dtype=int)
+    for ax, ep in zip(axes.flat, epochs_show):
+        ax.imshow(hist["weights"][ep].reshape(28, 28), cmap="RdBu_r")
+        ax.set_title(f"Epoch {ep+1}", fontsize=8)
+        ax.axis("off")
+    fig.suptitle("Perceptron Weight Evolution (28×28 pixel space)", fontsize=11)
+    fig_a2 = save_fig("partA_weight_evolution")
+
+    # -- Figure A3: Decision boundary (PCA 2D projection) ------------------
+    # Manual PCA (NumPy only)
+    mean = Xb_tr.mean(axis=0)
+    Xc = Xb_tr - mean
+    cov = (Xc.T @ Xc) / len(Xc)
+    vals, vecs = np.linalg.eigh(cov)
+    idx = np.argsort(vals)[::-1]
+    PC = vecs[:, idx[:2]]          # 784 × 2
+    Z  = Xc @ PC                   # N × 2
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    colors = ["#1f77b4", "#ff7f0e"]
+    for cls, col, lbl in zip([0,1], colors, ["Digit 0","Digit 1"]):
+        ax.scatter(Z[yb_tr==cls, 0], Z[yb_tr==cls, 1],
+                   c=col, s=5, alpha=0.4, label=lbl)
+    # Decision boundary in 2D: w·PC·z + b = 0
+    w2d = PC.T @ p.w          # 2-vector
+    if abs(w2d[1]) > 1e-9:
+        xs = np.linspace(Z[:,0].min(), Z[:,0].max(), 200)
+        ys = -(w2d[0]*xs + p.b) / w2d[1]
+        ax.plot(xs, ys, "r-", lw=2, label="Decision boundary")
+    ax.legend(); ax.set_title("Decision Boundary (PCA 2-D Projection)")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    fig_a3 = save_fig("partA_decision_boundary")
+
+    # -- Non-linear failure demonstration (XOR) ----------------------------
+    Xxor = np.array([[0,0],[0,1],[1,0],[1,1]], dtype=float)
+    yxor = np.array([0,1,1,0])
+    px = Perceptron(2, lr=0.1)
+    hx = px.fit(Xxor, yxor, epochs=100)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(hx["errors"], "r-o", markersize=4)
+    ax.set_title("XOR Failure – Errors Never Reach Zero\n(Perceptron cannot solve non-linearly separable problems)")
+    ax.set_xlabel("Epoch"); ax.set_ylabel("Misclassifications")
+    ax.axhline(y=0, color="k", ls="--", alpha=0.5)
+    ax.grid(True, alpha=0.3)
+    fig_a4 = save_fig("partA_XOR_failure")
+
+    print("  Part A complete.\n")
+    return acc, hist, [fig_a1, fig_a2, fig_a3, fig_a4]
+
+
+# -----------------------------------------------------------------------------
+# PART B – ADALINE / DELTA RULE
+# -----------------------------------------------------------------------------
+class Adaline:
+    """Adaptive Linear Neuron trained with the Widrow–Hoff (Delta) Rule."""
+    def __init__(self, n_features, lr=0.001):
+        rng = np.random.RandomState(1)
+        self.w  = rng.randn(n_features) * 0.01
+        self.b  = 0.0
+        self.lr = lr
+
+    def net_input(self, X):
+        return X @ self.w + self.b
+
+    def predict(self, X):
+        return np.where(self.net_input(X) >= 0.5, 1, 0)
+
+    def fit(self, X, y, epochs=50):
+        mse_hist = []
+        for _ in range(epochs):
+            output = self.net_input(X)
+            errors = y - output
+            self.w += self.lr * X.T @ errors
+            self.b += self.lr * errors.sum()
+            mse = np.mean(errors ** 2)
+            mse_hist.append(mse)
+        return mse_hist
+
+
+def run_part_b(X_tr, y_tr, X_te, y_te):
+    print("="*60)
+    print(" PART B – Delta Rule & Adaline")
+    print("="*60)
+
+    # Use digit 0 vs 1 (same binary task, labels ±1 for continuous output)
+    mask_tr = np.isin(y_tr, [0, 1])
+    mask_te = np.isin(y_te, [0, 1])
+    Xb_tr, yb_tr = X_tr[mask_tr][:2000], (y_tr[mask_tr][:2000] == 1).astype(float)
+    Xb_te, yb_te = X_te[mask_te][:400],  (y_te[mask_te][:400]  == 1).astype(float)
+
+    lrs    = [0.0001, 0.001, 0.01, 0.1]
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+    all_mse = {}
+
+    for lr in lrs:
+        ada = Adaline(784, lr=lr)
+        mse = ada.fit(Xb_tr, yb_tr, epochs=60)
+        all_mse[lr] = mse
+
+    # -- Figure B1: MSE convergence for all learning rates -----------------
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for lr, col in zip(lrs, colors):
+        mse = all_mse[lr]
+        ax.semilogy(mse, color=col, lw=1.8, label=f"? = {lr}")
+    ax.set_title("Adaline – MSE Convergence (Gradient Descent)")
+    ax.set_xlabel("Epoch"); ax.set_ylabel("Mean Squared Error (log scale)")
+    ax.legend(); ax.grid(True, alpha=0.3)
+    fig_b1 = save_fig("partB_MSE_convergence")
+
+    # -- Figure B2: Gradient descent trajectory in 2-D weight slice --------
+    # Sample two weight dimensions; show loss surface
+    best_lr = 0.001
+    ada_best = Adaline(784, lr=best_lr)
+
+    # Pre-compute loss surface over a 2-D slice (w[0], w[1])
+    w0_vals = np.linspace(-0.3, 0.3, 40)
+    w1_vals = np.linspace(-0.3, 0.3, 40)
+    W0, W1  = np.meshgrid(w0_vals, w1_vals)
+    LOSS = np.zeros_like(W0)
+    sample_X = Xb_tr[:200, :2]          # use first 2 features for vis
+    sample_y = yb_tr[:200]
+    for i in range(40):
+        for j in range(40):
+            out = sample_X[:,0]*W0[i,j] + sample_X[:,1]*W1[i,j]
+            LOSS[i,j] = np.mean((sample_y - out)**2)
+
+    # Track trajectory
+    w_traj = np.zeros(2)
+    b_traj = 0.0
+    traj   = [(w_traj[0], w_traj[1])]
+    for _ in range(40):
+        out    = sample_X @ w_traj + b_traj
+        err    = sample_y - out
+        w_traj += best_lr * sample_X.T @ err
+        b_traj += best_lr * err.sum()
+        traj.append((w_traj[0], w_traj[1]))
+    traj = np.array(traj)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    cs = ax.contourf(W0, W1, LOSS, levels=30, cmap="viridis_r", alpha=0.8)
+    plt.colorbar(cs, ax=ax, label="MSE")
+    ax.plot(traj[:,0], traj[:,1], "w-o", markersize=4, lw=1.5, label="GD trajectory")
+    ax.plot(traj[0,0], traj[0,1], "rs", markersize=8, label="Start")
+    ax.plot(traj[-1,0], traj[-1,1],"g*", markersize=12, label="End")
+    ax.set_title("Adaline – MSE Loss Surface & Gradient Descent Path\n(2-D weight slice)")
+    ax.set_xlabel("w0"); ax.set_ylabel("w1"); ax.legend()
+    fig_b2 = save_fig("partB_loss_surface")
+
+    # -- Figure B3: Accuracy comparison across learning rates --------------
+    fig, ax = plt.subplots(figsize=(8, 4))
+    final_acc = []
+    for lr, col in zip(lrs, colors):
+        ada = Adaline(784, lr=lr)
+        ada.fit(Xb_tr, yb_tr, epochs=60)
+        acc = np.mean(ada.predict(Xb_te) == yb_te.astype(int))
+        final_acc.append(acc)
+    bars = ax.bar([str(lr) for lr in lrs], final_acc, color=colors, edgecolor="k", alpha=0.85)
+    for bar, acc in zip(bars, final_acc):
+        ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.005,
+                f"{acc*100:.1f}%", ha="center", va="bottom", fontsize=9)
+    ax.set_title("Adaline – Final Test Accuracy vs Learning Rate")
+    ax.set_xlabel("Learning Rate (?)"); ax.set_ylabel("Accuracy")
+    ax.set_ylim(0, 1); ax.grid(axis="y", alpha=0.3)
+    fig_b3 = save_fig("partB_lr_accuracy")
+
+    print(f"  Best lr={best_lr}: final test accuracy = {final_acc[1]*100:.1f}%")
+    print("  Part B complete.\n")
+    return all_mse, [fig_b1, fig_b2, fig_b3]
+
+
+# -----------------------------------------------------------------------------
+# PART C – KOHONEN SELF-ORGANIZING MAP
+# -----------------------------------------------------------------------------
+class KohonenSOM:
+    """2-D competitive Kohonen Self-Organizing Map (NumPy only)."""
+    def __init__(self, grid_h=10, grid_w=10, n_features=784,
+                 lr0=0.5, sigma0=4.0, decay=500):
+        self.gh, self.gw = grid_h, grid_w
+        self.n  = grid_h * grid_w
+        rng     = np.random.RandomState(2)
+        self.W  = rng.rand(self.n, n_features).astype(np.float32)
+        self.lr0, self.sigma0, self.decay = lr0, sigma0, decay
+        # Grid coordinates
+        gx, gy = np.meshgrid(np.arange(grid_w), np.arange(grid_h))
+        self.coords = np.column_stack([gy.ravel(), gx.ravel()])   # (n, 2)
+
+    def _lr(self, t):
+        return self.lr0 * np.exp(-t / self.decay)
+
+    def _sigma(self, t):
+        return self.sigma0 * np.exp(-t / self.decay)
+
+    def _bmu(self, x):
+        dists = np.sum((self.W - x) ** 2, axis=1)
+        return np.argmin(dists)
+
+    def _neighbourhood(self, bmu_idx, sigma):
+        bmu_c  = self.coords[bmu_idx]
+        d2     = np.sum((self.coords - bmu_c) ** 2, axis=1)
+        return np.exp(-d2 / (2 * sigma**2))
+
+    def fit(self, X, n_iters=5000, verbose=True):
+        N = len(X)
+        qe_hist = []
+        for t in range(n_iters):
+            xi  = X[np.random.randint(N)]
+            bmu = self._bmu(xi)
+            lr  = self._lr(t)
+            sig = self._sigma(t)
+            h   = self._neighbourhood(bmu, sig)          # (n,)
+            self.W += (lr * h[:, None] * (xi - self.W)).astype(np.float32)
+            if (t+1) % 500 == 0:
+                qe = self.quantization_error(X[:500])
+                qe_hist.append(qe)
+                if verbose:
+                    print(f"    iter {t+1:5d} | lr={lr:.4f} | s={sig:.2f} | QE={qe:.4f}")
+        return qe_hist
+
+    def quantization_error(self, X):
+        errs = []
+        for xi in X:
+            bmu = self._bmu(xi)
+            errs.append(np.sqrt(np.sum((xi - self.W[bmu])**2)))
+        return float(np.mean(errs))
+
+    def topographic_error(self, X):
+        errors = 0
+        for xi in X:
+            dists  = np.sum((self.W - xi)**2, axis=1)
+            sorted_idx = np.argsort(dists)
+            bmu1, bmu2 = sorted_idx[0], sorted_idx[1]
+            c1, c2 = self.coords[bmu1], self.coords[bmu2]
+            if np.max(np.abs(c1 - c2)) > 1:   # not adjacent
+                errors += 1
+        return errors / len(X)
+
+    def map_labels(self, X, y):
+        """Assign dominant class label to each neuron."""
+        label_counts = np.zeros((self.n, 10), dtype=int)
+        for xi, yi in zip(X, y):
+            bmu = self._bmu(xi)
+            label_counts[bmu, yi] += 1
+        labels = np.argmax(label_counts, axis=1)
+        # Neurons with no samples get label -1
+        labels[label_counts.sum(axis=1) == 0] = -1
+        return labels, label_counts
+
+    def get_cluster_labels(self, X):
+        labels, _ = self.map_labels(X, np.zeros(len(X), int))  # placeholder
+        return np.array([labels[self._bmu(xi)] for xi in X])
+
+    def anomaly_score(self, X):
+        return np.array([np.sqrt(np.sum((x - self.W[self._bmu(x)])**2)) for x in X])
+
+    def u_matrix(self):
+        """Unified distance matrix."""
+        U = np.zeros(self.n)
+        for i in range(self.n):
+            ci = self.coords[i]
+            neighbours = []
+            for j in range(self.n):
+                cj = self.coords[j]
+                if 0 < np.max(np.abs(ci - cj)) <= 1:
+                    neighbours.append(np.sqrt(np.sum((self.W[i]-self.W[j])**2)))
+            U[i] = np.mean(neighbours) if neighbours else 0
+        return U.reshape(self.gh, self.gw)
+
+
+def run_part_c(X_tr, y_tr, X_te, y_te):
+    print("="*60)
+    print(" PART C – Kohonen Self-Organizing Map")
+    print("="*60)
+
+    # Subsample for speed
+    idx = np.random.choice(len(X_tr), 3000, replace=False)
+    Xs  = X_tr[idx];  ys = y_tr[idx]
+
+    som = KohonenSOM(grid_h=10, grid_w=10, n_features=784,
+                     lr0=0.5, sigma0=5.0, decay=600)
+    qe_hist = som.fit(Xs, n_iters=5000)
+
+    # Quality metrics
+    qe  = som.quantization_error(Xs[:500])
+    te  = som.topographic_error(Xs[:200])
+    print(f"  Quantization Error (QE)  : {qe:.4f}")
+    print(f"  Topographic Error (TE)   : {te:.4f}")
+
+    # Labels / class hit maps
+    neuron_labels, label_counts = som.map_labels(Xs, ys)
+
+    # -- Figure C1: U-matrix -----------------------------------------------
+    fig, ax = plt.subplots(figsize=(6, 5))
+    U = som.u_matrix()
+    im = ax.imshow(U, cmap="bone_r", interpolation="nearest")
+    plt.colorbar(im, ax=ax, label="Mean neighbour distance")
+    ax.set_title(f"SOM U-matrix (10×10 grid)\nQE={qe:.4f}  TE={te:.4f}")
+    ax.set_xlabel("Neuron column"); ax.set_ylabel("Neuron row")
+    fig_c1 = save_fig("partC_Umatrix")
+
+    # -- Figure C2: Class hit maps (one per digit) -------------------------
+    fig, axes = plt.subplots(2, 5, figsize=(13, 5))
+    fig.suptitle("SOM Class Hit Maps (which neurons activate for each digit)", fontsize=11)
+    cmap_heat = plt.cm.YlOrRd
+    for d, ax in enumerate(axes.flat):
+        hits = label_counts[:, d].reshape(10, 10)
+        im = ax.imshow(hits, cmap=cmap_heat, interpolation="nearest")
+        ax.set_title(f"Digit {d}", fontsize=9)
+        ax.axis("off")
+    plt.colorbar(im, ax=axes, fraction=0.02, pad=0.04, label="Count")
+    fig_c2 = save_fig("partC_class_hitmaps")
+
+    # -- Figure C3: Weight maps (neuron receptive fields as 28×28 images) --
+    fig, axes = plt.subplots(10, 10, figsize=(12, 12))
+    fig.suptitle("SOM Weight Maps – Neuron Receptive Fields (28×28)", fontsize=11)
+    for i, ax in enumerate(axes.flat):
+        ax.imshow(som.W[i].reshape(28, 28), cmap="gray")
+        ax.axis("off")
+    fig_c3 = save_fig("partC_weight_maps")
+
+    # -- Figure C4: Anomaly detection -------------------------------------
+    # Corrupt 5% of test samples
+    Xt = X_te[:500].copy()
+    labels_t = y_te[:500].copy()
+    corrupt_idx = np.random.choice(500, 25, replace=False)
+    Xt[corrupt_idx] = np.random.rand(25, 784).astype(np.float32)  # noise
+
+    scores = som.anomaly_score(Xt)
+    thresh = np.percentile(scores, 90)
+    predicted_anom = scores > thresh
+    true_anom      = np.zeros(500, bool)
+    true_anom[corrupt_idx] = True
+
+    TP = np.sum(predicted_anom & true_anom)
+    FP = np.sum(predicted_anom & ~true_anom)
+    FN = np.sum(~predicted_anom & true_anom)
+    precision = TP/(TP+FP) if (TP+FP)>0 else 0
+    recall    = TP/(TP+FN) if (TP+FN)>0 else 0
+    print(f"  Anomaly Detection ? Precision={precision:.2f}  Recall={recall:.2f}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    axes[0].hist(scores[~true_anom], bins=40, alpha=0.7, color="steelblue", label="Normal")
+    axes[0].hist(scores[true_anom],  bins=10, alpha=0.9, color="tomato",    label="Anomaly")
+    axes[0].axvline(thresh, color="k", ls="--", lw=1.5, label=f"Threshold={thresh:.2f}")
+    axes[0].set_title("Anomaly Score Distribution"); axes[0].set_xlabel("QE per sample")
+    axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+    axes[1].bar(["TP","FP","FN","TN"],
+                [TP, FP, FN, np.sum(~predicted_anom & ~true_anom)],
+                color=["green","orange","red","steelblue"], edgecolor="k")
+    axes[1].set_title(f"Anomaly Detector Results\nPrecision={precision:.2f}  Recall={recall:.2f}")
+    axes[1].grid(axis="y", alpha=0.3)
+    fig_c4 = save_fig("partC_anomaly_detection")
+
+    print("  Part C complete.\n")
+    return som, neuron_labels, qe, te, [fig_c1, fig_c2, fig_c3, fig_c4]
+
+
+# -----------------------------------------------------------------------------
+# PART D – BACKPROPAGATION MLP
+# -----------------------------------------------------------------------------
+def relu(x):          return np.maximum(0, x)
+def relu_d(x):        return (x > 0).astype(np.float32)
+def sigmoid(x):       return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+def sigmoid_d(x):     s = sigmoid(x); return s * (1 - s)
+def tanh_act(x):      return np.tanh(x)
+def tanh_d(x):        return 1.0 - np.tanh(x)**2
+def softmax(x):
+    e = np.exp(x - x.max(axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
+def cross_entropy(probs, y_oh):
+    return -np.mean(np.sum(y_oh * np.log(probs + 1e-12), axis=1))
+def one_hot(y, n_classes=10):
+    oh = np.zeros((len(y), n_classes), dtype=np.float32)
+    oh[np.arange(len(y)), y] = 1.0
+    return oh
+
+
+class MLP:
+    """
+    Fully-connected MLP  784 ? 128 ? 64 ? 10
+    Supports Sigmoid / Tanh / ReLU hidden activations.
+    L2 regularisation + Dropout.
+    """
+    def __init__(self, hidden_act="relu", lr=0.01,
+                 l2=1e-4, dropout_rate=0.0):
+        self.lr      = lr
+        self.l2      = l2
+        self.dr      = dropout_rate
+        self.act_name = hidden_act
+        if   hidden_act == "sigmoid": self.act, self.act_d = sigmoid, sigmoid_d
+        elif hidden_act == "tanh"   : self.act, self.act_d = tanh_act, tanh_d
+        else                        : self.act, self.act_d = relu,     relu_d
+        self._init_weights()
+
+    def _init_weights(self):
+        rng = np.random.RandomState(42)
+        self.W1 = rng.randn(784, 128).astype(np.float32) * np.sqrt(2/784)
+        self.b1 = np.zeros((1, 128), dtype=np.float32)
+        self.W2 = rng.randn(128,  64).astype(np.float32) * np.sqrt(2/128)
+        self.b2 = np.zeros((1,  64), dtype=np.float32)
+        self.W3 = rng.randn( 64,  10).astype(np.float32) * np.sqrt(2/ 64)
+        self.b3 = np.zeros((1,  10), dtype=np.float32)
+
+    def _dropout_mask(self, X):
+        if self.dr == 0.0:
+            return np.ones_like(X)
+        mask = (np.random.rand(*X.shape) > self.dr).astype(np.float32)
+        return mask / (1 - self.dr)
+
+    def forward(self, X, training=False):
+        self.Z1 = X @ self.W1 + self.b1
+        self.A1 = self.act(self.Z1)
+        if training: self.M1 = self._dropout_mask(self.A1); self.A1 = self.A1 * self.M1
+        self.Z2 = self.A1 @ self.W2 + self.b2
+        self.A2 = self.act(self.Z2)
+        if training: self.M2 = self._dropout_mask(self.A2); self.A2 = self.A2 * self.M2
+        self.Z3 = self.A2 @ self.W3 + self.b3
+        self.A3 = softmax(self.Z3)
+        return self.A3
+
+    def backward(self, X, y_oh):
+        n = len(X)
+        dZ3 = (self.A3 - y_oh) / n
+        dW3 = self.A2.T @ dZ3 + self.l2 * self.W3
+        db3 = dZ3.sum(axis=0, keepdims=True)
+
+        dA2 = dZ3 @ self.W3.T
+        if self.dr > 0: dA2 *= self.M2
+        dZ2 = dA2 * self.act_d(self.Z2)
+        dW2 = self.A1.T @ dZ2 + self.l2 * self.W2
+        db2 = dZ2.sum(axis=0, keepdims=True)
+
+        dA1 = dZ2 @ self.W2.T
+        if self.dr > 0: dA1 *= self.M1
+        dZ1 = dA1 * self.act_d(self.Z1)
+        dW1 = X.T @ dZ1 + self.l2 * self.W1
+        db1 = dZ1.sum(axis=0, keepdims=True)
+
+        self.W3 -= self.lr * dW3; self.b3 -= self.lr * db3
+        self.W2 -= self.lr * dW2; self.b2 -= self.lr * db2
+        self.W1 -= self.lr * dW1; self.b1 -= self.lr * db1
+
+    def predict(self, X):
+        return np.argmax(self.forward(X, training=False), axis=1)
+
+    def fit(self, X_tr, y_tr, X_val, y_val, epochs=30, batch_size=128, verbose=True):
+        y_oh_tr  = one_hot(y_tr)
+        n        = len(X_tr)
+        tr_loss, val_loss, tr_acc, val_acc = [], [], [], []
+        for ep in range(epochs):
+            idx = np.random.permutation(n)
+            for start in range(0, n, batch_size):
+                xi = X_tr[idx[start:start+batch_size]]
+                yi = y_oh_tr[idx[start:start+batch_size]]
+                self.forward(xi, training=True)
+                self.backward(xi, yi)
+            # Metrics
+            p_tr  = self.forward(X_tr, training=False)
+            loss_t = cross_entropy(p_tr, y_oh_tr)
+            acc_t  = np.mean(np.argmax(p_tr,axis=1)==y_tr)
+            p_v   = self.forward(X_val, training=False)
+            loss_v = cross_entropy(p_v, one_hot(y_val))
+            acc_v  = np.mean(np.argmax(p_v,axis=1)==y_val)
+            tr_loss.append(loss_t); val_loss.append(loss_v)
+            tr_acc.append(acc_t);   val_acc.append(acc_v)
+            if verbose and (ep+1) % 5 == 0:
+                print(f"    Epoch {ep+1:3d}/{epochs} | loss={loss_t:.4f} | val_loss={loss_v:.4f} | val_acc={acc_v*100:.1f}%")
+        return tr_loss, val_loss, tr_acc, val_acc
+
+
+def confusion_matrix_np(y_true, y_pred, n=10):
+    cm = np.zeros((n, n), dtype=int)
+    for t, p in zip(y_true, y_pred): cm[t, p] += 1
+    return cm
+
+
+def run_part_d(X_tr, y_tr, X_te, y_te, som, neuron_labels):
+    print("="*60)
+    print(" PART D – Backpropagation MLP")
+    print("="*60)
+
+    # Use full training set (subsample for speed if needed)
+    N_tr = min(len(X_tr), 12000)
+    N_te = min(len(X_te), 2000)
+    X_t, y_t = X_tr[:N_tr], y_tr[:N_tr]
+    X_v, y_v = X_te[:N_te], y_te[:N_te]
+
+    # -- 1. Baseline ReLU MLP ----------------------------------------------
+    print("\n  [D-1] Baseline MLP (ReLU, no regularisation)…")
+    mlp_base = MLP(hidden_act="relu", lr=0.01, l2=0.0, dropout_rate=0.0)
+    res_base = mlp_base.fit(X_t, y_t, X_v, y_v, epochs=30)
+    acc_base = np.mean(mlp_base.predict(X_v) == y_v)
+    print(f"  Baseline test accuracy: {acc_base*100:.2f}%")
+
+    # -- 2. Activation function comparison --------------------------------
+    print("\n  [D-2] Activation function comparison…")
+    results_act = {}
+    for act in ["sigmoid", "tanh", "relu"]:
+        m = MLP(hidden_act=act, lr=0.01, l2=0.0, dropout_rate=0.0)
+        res = m.fit(X_t, y_t, X_v, y_v, epochs=25, verbose=False)
+        results_act[act] = res
+        acc = np.mean(m.predict(X_v) == y_v)
+        print(f"    {act:10s}: val_acc = {acc*100:.2f}%")
+
+    # -- 3. Regularisation study -------------------------------------------
+    print("\n  [D-3] Regularisation (L2 + Dropout)…")
+    mlp_reg = MLP(hidden_act="relu", lr=0.01, l2=1e-4, dropout_rate=0.3)
+    res_reg = mlp_reg.fit(X_t, y_t, X_v, y_v, epochs=30, verbose=False)
+    acc_reg = np.mean(mlp_reg.predict(X_v) == y_v)
+    print(f"  Regularised MLP test accuracy: {acc_reg*100:.2f}%")
+
+    # -- 4. SOM integration ------------------------------------------------
+    print("\n  [D-4] SOM-augmented MLP…")
+    # Get SOM cluster label (an integer 0–99 for 10×10 grid) as extra feature
+    som_feats_tr = np.array([som._bmu(xi) for xi in X_t], dtype=np.float32) / 99.0
+    som_feats_te = np.array([som._bmu(xi) for xi in X_v], dtype=np.float32) / 99.0
+    X_aug_tr = np.column_stack([X_t, som_feats_tr])   # 785-dim
+    X_aug_te = np.column_stack([X_v, som_feats_te])
+
+    class MLP785(MLP):
+        def _init_weights(self):
+            rng = np.random.RandomState(42)
+            self.W1 = rng.randn(785, 128).astype(np.float32)*np.sqrt(2/785)
+            self.b1 = np.zeros((1,128),dtype=np.float32)
+            self.W2 = rng.randn(128, 64).astype(np.float32)*np.sqrt(2/128)
+            self.b2 = np.zeros((1, 64),dtype=np.float32)
+            self.W3 = rng.randn( 64, 10).astype(np.float32)*np.sqrt(2/ 64)
+            self.b3 = np.zeros((1, 10),dtype=np.float32)
+
+    mlp_som = MLP785(hidden_act="relu", lr=0.01, l2=1e-4, dropout_rate=0.0)
+    res_som  = mlp_som.fit(X_aug_tr, y_t, X_aug_te, y_v, epochs=25, verbose=False)
+    acc_som  = np.mean(mlp_som.predict(X_aug_te) == y_v)
+    print(f"  SOM-integrated MLP test accuracy: {acc_som*100:.2f}%")
+
+    # -------------------------------------------------------
+    # FIGURES
+    # -------------------------------------------------------
+
+    # -- Figure D1: Training & validation curves ---------------------------
+    tr_loss, val_loss, tr_acc_b, val_acc_b = res_base
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(tr_loss,  "b-",  lw=1.8, label="Train loss")
+    axes[0].plot(val_loss, "r--", lw=1.8, label="Val loss")
+    axes[0].set_title("MLP – Loss Curves (Baseline ReLU)")
+    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Cross-Entropy Loss")
+    axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(tr_acc_b,  "b-",  lw=1.8, label="Train acc")
+    axes[1].plot(val_acc_b, "r--", lw=1.8, label="Val acc")
+    axes[1].set_title("MLP – Accuracy Curves (Baseline ReLU)")
+    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Accuracy")
+    axes[1].set_ylim(0,1); axes[1].legend(); axes[1].grid(True, alpha=0.3)
+    fig_d1 = save_fig("partD_training_curves")
+
+    # -- Figure D2: Activation comparison ---------------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    colors_act = {"sigmoid":"#e74c3c", "tanh":"#2ecc71", "relu":"#3498db"}
+    for act, color in colors_act.items():
+        _, _, _, va = results_act[act]
+        axes[0].plot(va, color=color, lw=1.8, label=act.capitalize())
+    axes[0].set_title("Validation Accuracy – Activation Comparison")
+    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Val Accuracy")
+    axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+    # Gradient magnitude proxy: activation derivative at sample input
+    xs = np.linspace(-5, 5, 200)
+    axes[1].plot(xs, sigmoid_d(xs),  color="#e74c3c", lw=2, label="s' (sigmoid)")
+    axes[1].plot(xs, tanh_d(xs),     color="#2ecc71", lw=2, label="tanh'")
+    axes[1].plot(xs, relu_d(xs),     color="#3498db", lw=2, label="ReLU'")
+    axes[1].set_title("Activation Function Derivatives\n(Vanishing Gradient Analysis)")
+    axes[1].set_xlabel("x"); axes[1].set_ylabel("Derivative"); axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    fig_d2 = save_fig("partD_activation_comparison")
+
+    # -- Figure D3: Regularisation effect ----------------------------------
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(res_base[0], "b-",  lw=1.8, label="Baseline train loss")
+    ax.plot(res_base[1], "b--", lw=1.8, label="Baseline val loss")
+    ax.plot(res_reg[0],  "r-",  lw=1.8, label="Regularised train loss")
+    ax.plot(res_reg[1],  "r--", lw=1.8, label="Regularised val loss")
+    ax.set_title("Regularisation Effect (L2 + Dropout vs Baseline)")
+    ax.set_xlabel("Epoch"); ax.set_ylabel("Loss"); ax.legend(); ax.grid(True, alpha=0.3)
+    fig_d3 = save_fig("partD_regularization")
+
+    # -- Figure D4: Confusion matrix ---------------------------------------
+    cm = confusion_matrix_np(y_v, mlp_base.predict(X_v))
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(cm, cmap="Blues")
+    plt.colorbar(im, ax=ax)
+    ax.set_xticks(range(10)); ax.set_yticks(range(10))
+    ax.set_xticklabels(range(10)); ax.set_yticklabels(range(10))
+    for i in range(10):
+        for j in range(10):
+            ax.text(j, i, str(cm[i,j]), ha="center", va="center",
+                    color="white" if cm[i,j] > cm.max()*0.6 else "black", fontsize=8)
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    ax.set_title(f"Confusion Matrix – Baseline MLP\nAcc={acc_base*100:.1f}%")
+    fig_d4 = save_fig("partD_confusion_matrix")
+
+    # -- Figure D5: Model comparison bar chart -----------------------------
+    models  = ["Perceptron", "Adaline", "SOM", "MLP Baseline", "MLP+L2+DO", "MLP+SOM"]
+    accs    = [0.0, 0.0, 0.0, acc_base, acc_reg, acc_som]
+    # Fill Perceptron and Adaline placeholders (from global)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bar_colors = ["#95a5a6","#95a5a6","#95a5a6","#3498db","#e67e22","#2ecc71"]
+    bars = ax.bar(models, accs, color=bar_colors, edgecolor="k", alpha=0.85)
+    for bar, a in zip(bars, accs):
+        if a > 0:
+            ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.005,
+                    f"{a*100:.1f}%", ha="center", va="bottom", fontsize=9)
+    ax.set_title("Model Comparison – Test Accuracy")
+    ax.set_ylabel("Accuracy"); ax.set_ylim(0,1.05)
+    ax.axhline(0.95, color="red", ls="--", lw=1, label="95% target")
+    ax.legend(); ax.grid(axis="y", alpha=0.3)
+    plt.xticks(rotation=15, ha="right")
+    fig_d5 = save_fig("partD_model_comparison")
+
+    print(f"\n  Final comparison:")
+    print(f"    Baseline MLP    : {acc_base*100:.2f}%")
+    print(f"    MLP+L2+Dropout  : {acc_reg*100:.2f}%")
+    print(f"    MLP+SOM feature : {acc_som*100:.2f}%")
+    print("  Part D complete.\n")
+    return acc_base, acc_reg, acc_som, [fig_d1, fig_d2, fig_d3, fig_d4, fig_d5]
+
+
+# -----------------------------------------------------------------------------
+# BIOLOGICAL ANALOGY DIAGRAM (for report)
+# -----------------------------------------------------------------------------
+def draw_bio_analogy():
+    fig = plt.figure(figsize=(14, 5))
+    ax  = fig.add_subplot(111)
+    ax.set_xlim(0, 14); ax.set_ylim(0, 5); ax.axis("off")
+    ax.set_title("Biological Neuron  ?  Mathematical Perceptron", fontsize=13, pad=10)
+
+    # -- Biological side --------------------------------------------------
+    ax.text(1.5, 4.5, "Biological Neuron", fontsize=11, ha="center", weight="bold", color="#16a085")
+    parts = [("Dendrites",  "Receive input signals",       1.5, 3.8),
+             ("Soma (Cell Body)", "Integrate weighted inputs",  1.5, 3.1),
+             ("Axon Hillock", "Threshold: fires if = ?",   1.5, 2.4),
+             ("Axon",        "Transmit output signal",      1.5, 1.7),
+             ("Synapse",     "Connection weight (strength)",1.5, 1.0)]
+    for name, desc, x, y in parts:
+        ax.text(x, y+0.15, f"? {name}", fontsize=9, weight="bold", color="#1abc9c")
+        ax.text(x, y-0.1,  desc, fontsize=8, color="#555", ha="center")
+        ax.add_patch(FancyBboxPatch((0.1, y-0.25), 2.8, 0.55,
+                                        boxstyle="round,pad=0.05",
+                                        fc="#eafaf1", ec="#1abc9c", lw=1))
+
+    # -- Arrow ------------------------------------------------------------
+    ax.annotate("", xy=(6, 2.5), xytext=(4.5, 2.5),
+                arrowprops=dict(arrowstyle="->, head_width=0.4", color="#e74c3c", lw=2))
+    ax.text(5.2, 2.75, "Maps\nto", ha="center", fontsize=10, color="#e74c3c")
+
+    # -- Mathematical side ------------------------------------------------
+    ax.text(9.5, 4.5, "Mathematical Perceptron", fontsize=11, ha="center", weight="bold", color="#2980b9")
+    math_parts = [("Inputs  x1, x2, …, x?", "Feature vector from dataset",      9.5, 3.8),
+                  ("Weights w1, w2, …, w?",  "Learnable parameters",            9.5, 3.1),
+                  ("Net Input: S w?x? + b",   "Weighted sum with bias",          9.5, 2.4),
+                  ("Step Activation f(·)",     "f(z) = 1 if z=0 else 0",         9.5, 1.7),
+                  ("Output y",                 "Binary classification decision",  9.5, 1.0)]
+    for name, desc, x, y in math_parts:
+        ax.text(x, y+0.15, f"? {name}", fontsize=9, weight="bold", color="#2980b9")
+        ax.text(x, y-0.1,  desc, fontsize=8, color="#555", ha="center")
+        ax.add_patch(FancyBboxPatch((7.0, y-0.25), 5.0, 0.55,
+                                        boxstyle="round,pad=0.05",
+                                        fc="#ebf5fb", ec="#2980b9", lw=1))
+
+    fig_bio = save_fig("partA_bio_analogy")
+    return fig_bio
+
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("   NEURAL COMPUTING SYSTEM – CCP IMPLEMENTATION")
+    print("="*60)
+    print("\nLoading MNIST dataset…")
+    X_tr, y_tr, X_te, y_te = load_mnist()
+    print(f"  Train: {X_tr.shape}  Test: {X_te.shape}")
+
+    fig_bio = draw_bio_analogy()
+
+    acc_perc, hist_perc, figs_a = run_part_a(X_tr, y_tr, X_te, y_te)
+    mse_dict, figs_b             = run_part_b(X_tr, y_tr, X_te, y_te)
+    som, neuron_labels, qe, te_metric, figs_c = run_part_c(X_tr, y_tr, X_te, y_te)
+    acc_base, acc_reg, acc_som, figs_d        = run_part_d(X_tr, y_tr, X_te, y_te, som, neuron_labels)
+
+    print("\n" + "="*60)
+    print(" ALL PARTS COMPLETE – figures saved to /mnt/user-data/outputs/")
+    print("="*60)
