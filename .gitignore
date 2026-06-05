@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+env/
+
+# Model files (too large for GitHub)
+*.h5
+*.pkl
+
+# System files
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (optional - keep csv)
+# parkinsons.csv
